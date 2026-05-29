@@ -1,0 +1,123 @@
+---
+- name: Config serveur MediTrack  # playbook pour preparer l'EC2
+  hosts: webservers
+  become: true  # besoin des droits root
+
+  tasks:
+    - wait_for_connection:
+        timeout: 300
+
+    # --- debrouillons le serveur ---
+    - apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - apt:
+        name: [nginx, ufw, fail2ban, unattended-upgrades]
+        state: present
+
+    # --- pare-feu ---
+    # on ferme tout par defaut, on ouvre seulement le necessaire
+    - community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: incoming, policy: deny }  # rien n'entre sans regle explicite
+        - { direction: outgoing, policy: allow }  # le serveur peut sortir
+
+    - community.general.ufw:  # ports ouverts au public
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ['22', '80', '443']  # ssh pour admin, 80/443 pour le site
+
+    - community.general.ufw:  # on active ufw pour de vrai
+        state: enabled
+        logging: medium  # utile pour voir qui se fait bloquer
+
+    # --- utilisateur meditrack (pas de root) ---
+    - user:
+        name: meditrack
+        shell: /bin/bash
+        groups: www-data  # acces aux fichiers servis par nginx
+        append: true
+        create_home: true
+
+    - copy:  # sudo limite : meditrack peut juste gerer nginx
+        dest: /etc/sudoers.d/meditrack
+        mode: '0440'  # fichier sensible, permissions strictes
+        validate: visudo -cf %s  # verifie que le fichier est valide
+        content: "meditrack ALL=(ALL) NOPASSWD: /usr/bin/systemctl reload nginx, /usr/bin/systemctl status nginx\n"
+
+    # on durcit ssh
+    - lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }  # fini le login root
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }  # cle ssh seulement
+      notify: restart ssh  # applique les changements ssh
+
+    # --- deploiement du site statique ---
+    - file:  # cree /var/www/html si besoin
+        path: /var/www/html
+        state: directory
+        owner: www-data  # nginx tourne avec cet user
+        group: www-data
+        mode: '0755'
+
+    - copy:  # copie le contenu du dossier site/ du projet
+        src: ../site/
+        dest: /var/www/html/
+        owner: www-data
+        group: www-data
+        mode: '0644'  # fichiers en lecture pour nginx
+        directory_mode: '0755'
+
+    # --- nginx ---
+    # vhost meditrack, on remplace le site par defaut
+    - block:
+        - copy:  # fichier de conf + quelques headers de securite
+            dest: /etc/nginx/sites-available/meditrack
+            mode: '0644'
+            content: |
+              server {
+                  listen 80 default_server; listen [::]:80 default_server;
+                  root /var/www/html; index index.html; server_name _; server_tokens off;
+                  add_header X-Frame-Options "SAMEORIGIN" always;
+                  add_header X-Content-Type-Options "nosniff" always;
+                  add_header X-XSS-Protection "1; mode=block" always;
+                  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+                  location / { try_files $uri $uri/ =404; }
+                  location ~ /\. { deny all; access_log off; log_not_found off; }
+              }
+        - file:  # active le site meditrack
+            src: /etc/nginx/sites-available/meditrack
+            dest: /etc/nginx/sites-enabled/meditrack
+            state: link
+        - file:  # supprime la page d'accueil ubuntu par defaut
+            path: /etc/nginx/sites-enabled/default
+            state: absent
+      notify: reload nginx  # recharge nginx si la conf a bouge
+
+    - command: nginx -t  # petit controle avant de laisser tourner
+      changed_when: false  # cette commande ne compte pas comme un changement
+
+    - systemd:  # lance nginx et fail2ban
+        name: "{{ item }}"
+        enabled: true  # redemarrage auto apres reboot
+        state: started
+      loop: [nginx, fail2ban]  # site web + protection ssh
+
+  # --- handlers : relance les services modifies ---
+  handlers:  # executes a la fin du playbook si notify
+    - name: restart ssh  # apres modif sshd_config
+      systemd:
+        name: ssh
+        state: restarted
+
+    - name: reload nginx  # recharge la conf sans arreter le service
+      systemd:
+        name: nginx
+        state: reloaded
